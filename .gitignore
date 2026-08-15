@@ -1,0 +1,89 @@
+# Dependencies and package managers
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+
+# React Router and Vite outputs
+.react-router/
+build/
+dist/
+coverage/
+.vite/
+.vitest/
+.cache/
+out/
+tmp/
+temp/
+*.tsbuildinfo
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Logs and temp files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.pid
+*.seed
+*.pid.lock
+*.tmp
+*.orig
+*.orig.*
+*.swp
+*.swo
+*~
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+!.env.sample
+*.jks
+*.p8
+*.p12
+*.key
+*.pem
+*.mobileprovision
+*.keystore
+
+# IDE and editor
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Local assistant/tooling
+.claude/
+.codex/
+.cursorrules
+
+# Project-local Muse Glimmer runtime, model weights, and build caches
+.runtime/
+
+# Launcher generated locally by setup.sh to avoid macOS quarantine on downloads
+/Muse Glimmer.command
+/.muse-glimmer-launcher.*
+
+# Vercel local project/build metadata
+.vercel/

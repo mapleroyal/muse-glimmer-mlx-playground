@@ -1,0 +1,487 @@
+diff --git a/examples/llm_server/cpp/worker_loop.h b/examples/llm_server/cpp/worker_loop.h
+index e25bfd93f..cae10d6a8 100644
+--- a/examples/llm_server/cpp/worker_loop.h
++++ b/examples/llm_server/cpp/worker_loop.h
+@@ -65,6 +65,7 @@
+ #include <chrono>
+ #include <cmath>
+ #include <cstdint>
++#include <functional>
+ #include <iostream>
+ #include <iterator>
+ #include <limits>
+@@ -115,7 +116,8 @@ inline void worker_handle_request(
+     const nlohmann::json& req,
+     const std::vector<uint64_t>& prompt_prefix_ids = {},
+     const nlohmann::json& additional_terminal_stats =
+-        nlohmann::json::object()) {
++        nlohmann::json::object(),
++    const std::function<bool()>& cancel_requested = {}) {
+   if (!additional_terminal_stats.is_object()) {
+     throw std::runtime_error("additional terminal stats must be a JSON object");
+   }
+@@ -277,6 +279,9 @@ inline void worker_handle_request(
+   std::string finish = "length"; // EOS or stop string -> "stop"
+   bool stop_string = false; // a request stop string was matched
+   for (int64_t step = 0; step < max_new; ++step) {
++    if (cancel_requested && cancel_requested()) {
++      session.stop();
++    }
+     auto step_result = session.decode_one(sampling);
+     if (step_result.error() != ::executorch::runtime::Error::Ok) {
+       st.dirty = true;
+diff --git a/examples/llm_server/python/session_runtime.py b/examples/llm_server/python/session_runtime.py
+index 79f8e0569..b3a98e0f2 100644
+--- a/examples/llm_server/python/session_runtime.py
++++ b/examples/llm_server/python/session_runtime.py
+@@ -212,9 +212,9 @@ class SessionRuntime:
+         async with self._lock:
+             await loop.run_in_executor(self._executor, op, session_id)
+ 
+-    def stop(self) -> None:
++    def stop(self, session_id: Optional[str] = None) -> bool:
+         """Request the in-flight generation stop at the next token boundary."""
+-        self._worker.stop()
++        return bool(self._worker.stop(session_id))
+ 
+     async def generate_stream(
+         self,
+diff --git a/examples/llm_server/python/worker_client.py b/examples/llm_server/python/worker_client.py
+index 2fd81acd8..1b06adb99 100644
+--- a/examples/llm_server/python/worker_client.py
++++ b/examples/llm_server/python/worker_client.py
+@@ -102,6 +102,12 @@ class WorkerClient:
+     def __init__(self, proc: subprocess.Popen, max_named_sessions: int = 0):
+         self._proc = proc
+         self._lock = threading.Lock()
++        # Generation holds _lock while it reads the response stream. A separate
++        # write lock lets stop() send the out-of-band cancel line concurrently.
++        self._write_lock = threading.Lock()
++        self._generation_state_lock = threading.Lock()
++        self._generation_active = False
++        self._active_session_id: Optional[str] = None
+         # Named sessions this worker can host (0 = scratch-only / single session).
+         self.max_named_sessions = max_named_sessions
+ 
+@@ -110,14 +116,30 @@ class WorkerClient:
+         # worker's prefill plan.
+         pass
+ 
+-    def stop(self) -> None:
+-        # No-op: a worker request is synchronous over the JSONL pipe and is
+-        # NOT interruptible mid-generation. The in-flight request runs to
+-        # completion and head-of-line blocks every other session on this worker
+-        # until it finishes. Real cancellation needs a protocol change (a control
+-        # pipe, non-blocking stdin polling between decode steps, or request ids +
+-        # an out-of-band cancel op).
+-        pass
++    def stop(self, session_id: Optional[str] = None) -> bool:
++        # The Muse worker polls stdin between decode steps and consumes this
++        # control message without writing an acknowledgement into the active
++        # generation's response stream. Hold the state lock through the write so
++        # a stale targeted cancel cannot cross a generation boundary.
++        with self._generation_state_lock:
++            if not self._generation_active:
++                return False
++            if session_id is not None and session_id != self._active_session_id:
++                return False
++            self._write_request({"op": "cancel"})
++            return True
++
++    def _write_request(self, request: dict) -> None:
++        with self._write_lock:
++            if self._proc.poll() is not None:
++                raise WorkerError(
++                    f"worker exited (code {self._proc.returncode}); restart the server"
++                )
++            try:
++                self._proc.stdin.write(json.dumps(request) + "\n")
++                self._proc.stdin.flush()
++            except (BrokenPipeError, ValueError) as e:
++                raise WorkerError("worker stdin is closed") from e
+ 
+     def open_session(self, session_id: str) -> None:
+         """Admit a named session (idempotent). Raises WorkerError with a `code`
+@@ -135,15 +157,7 @@ class WorkerClient:
+ 
+     def _op(self, request: dict, ack_key: str) -> None:
+         with self._lock:
+-            if self._proc.poll() is not None:
+-                raise WorkerError(
+-                    f"worker exited (code {self._proc.returncode}); restart the server"
+-                )
+-            try:
+-                self._proc.stdin.write(json.dumps(request) + "\n")
+-                self._proc.stdin.flush()
+-            except (BrokenPipeError, ValueError) as e:
+-                raise WorkerError("worker stdin is closed") from e
++            self._write_request(request)
+             line = self._proc.stdout.readline()
+             if not line:
+                 raise WorkerError("worker exited mid-request")
+@@ -205,31 +219,30 @@ class WorkerClient:
+         if session_id:
+             request["session_id"] = session_id
+         with self._lock:
+-            if self._proc.poll() is not None:
+-                raise WorkerError(
+-                    f"worker exited (code {self._proc.returncode}); restart the server"
+-                )
++            with self._generation_state_lock:
++                self._write_request(request)
++                self._generation_active = True
++                self._active_session_id = session_id
+             try:
+-                self._proc.stdin.write(json.dumps(request) + "\n")
+-                self._proc.stdin.flush()
+-            except (BrokenPipeError, ValueError) as e:
+-                raise WorkerError("worker stdin is closed") from e
+-
+-            while True:
+-                line = self._proc.stdout.readline()
+-                if not line:
+-                    raise WorkerError("worker exited mid-request")
+-                msg = _decode_worker_json(line)
+-                if "token" in msg:
+-                    if token_callback is not None:
+-                        token_callback(msg["token"])
+-                elif msg.get("done"):
+-                    self._on_done(msg, stats_callback)
+-                    return
+-                elif "error" in msg:
+-                    raise WorkerError(msg["error"], code=msg.get("code"))
+-                else:
+-                    raise WorkerError(f"unexpected worker response: {msg}")
++                while True:
++                    line = self._proc.stdout.readline()
++                    if not line:
++                        raise WorkerError("worker exited mid-request")
++                    msg = _decode_worker_json(line)
++                    if "token" in msg:
++                        if token_callback is not None:
++                            token_callback(msg["token"])
++                    elif msg.get("done"):
++                        self._on_done(msg, stats_callback)
++                        return
++                    elif "error" in msg:
++                        raise WorkerError(msg["error"], code=msg.get("code"))
++                    else:
++                        raise WorkerError(f"unexpected worker response: {msg}")
++            finally:
++                with self._generation_state_lock:
++                    self._generation_active = False
++                    self._active_session_id = None
+ 
+     def close(self) -> None:
+         """Terminate the worker process (called at server shutdown)."""
+diff --git a/examples/models/muse-glimmer/runtime/engine/dflash_session.cpp b/examples/models/muse-glimmer/runtime/engine/dflash_session.cpp
+index 50a844521..ecf54832b 100644
+--- a/examples/models/muse-glimmer/runtime/engine/dflash_session.cpp
++++ b/examples/models/muse-glimmer/runtime/engine/dflash_session.cpp
+@@ -482,6 +482,10 @@ class DFlashSession final : public LLMSession, public DFlashMultimodalSession {
+     preserve_staged_image_on_next_reset_ = false;
+   }
+ 
++  int mutable_state_session_token() const override {
++    return config_.session_token;
++  }
++
+  private:
+   struct TargetResult {
+     uint64_t sampled_token = 0;
+diff --git a/examples/models/muse-glimmer/runtime/engine/muse_glimmer_engine.cpp b/examples/models/muse-glimmer/runtime/engine/muse_glimmer_engine.cpp
+index 8ffd20aa8..af946a2c7 100644
+--- a/examples/models/muse-glimmer/runtime/engine/muse_glimmer_engine.cpp
++++ b/examples/models/muse-glimmer/runtime/engine/muse_glimmer_engine.cpp
+@@ -773,6 +773,10 @@ class MuseGlimmerSession : public LLMSession,
+     preserve_staged_image_on_next_reset_ = false;
+   }
+ 
++  int mutable_state_session_token() const override {
++    return session_token_;
++  }
++
+  private:
+   Error validate_staged_image(
+       const std::vector<uint64_t>& tokens,
+@@ -1517,21 +1521,47 @@ Result<std::unique_ptr<MuseGlimmerEngine>> MuseGlimmerEngine::create(
+ MuseGlimmerEngine::~MuseGlimmerEngine() = default;
+ 
+ Result<PreparedMuseGlimmerImage> MuseGlimmerEngine::prepare_image_from_file(
+-    const std::string& image_path) const {
++    const std::string& image_path,
++    int session_token) const {
+   ET_CHECK_OR_RETURN_ERROR(
+       vision_runtime_ != nullptr,
+       NotSupported,
+       "Muse Glimmer artifact does not support image input");
+-  return vision_runtime_->prepare_image_from_file(image_path);
++  MuseGlimmerVisionExecute execute;
++  if (rebind_available_) {
++    ET_CHECK_OR_RETURN_ERROR(
++        session_token != kMuseGlimmerNoMutableSession,
++        InvalidArgument,
++        "Multi-session image input requires an active session token");
++    execute = [this, session_token](const std::vector<EValue>& inputs) {
++      return mutable_state_->with_active_session(session_token, [&]() {
++        return shared_module_->execute(kMuseGlimmerVisionEncoderMethod, inputs);
++      });
++    };
++  }
++  return vision_runtime_->prepare_image_from_file(image_path, execute);
+ }
+ 
+ Result<PreparedMuseGlimmerImage> MuseGlimmerEngine::prepare_image_from_bytes(
+-    ::executorch::runtime::Span<const uint8_t> encoded_image) const {
++    ::executorch::runtime::Span<const uint8_t> encoded_image,
++    int session_token) const {
+   ET_CHECK_OR_RETURN_ERROR(
+       vision_runtime_ != nullptr,
+       NotSupported,
+       "Muse Glimmer artifact does not support image input");
+-  return vision_runtime_->prepare_image_from_bytes(encoded_image);
++  MuseGlimmerVisionExecute execute;
++  if (rebind_available_) {
++    ET_CHECK_OR_RETURN_ERROR(
++        session_token != kMuseGlimmerNoMutableSession,
++        InvalidArgument,
++        "Multi-session image input requires an active session token");
++    execute = [this, session_token](const std::vector<EValue>& inputs) {
++      return mutable_state_->with_active_session(session_token, [&]() {
++        return shared_module_->execute(kMuseGlimmerVisionEncoderMethod, inputs);
++      });
++    };
++  }
++  return vision_runtime_->prepare_image_from_bytes(encoded_image, execute);
+ }
+ 
+ Result<std::unique_ptr<LLMSession>> MuseGlimmerEngine::create_session() {
+diff --git a/examples/models/muse-glimmer/runtime/engine/muse_glimmer_engine.h b/examples/models/muse-glimmer/runtime/engine/muse_glimmer_engine.h
+index 06709f5c0..63633f0ae 100644
+--- a/examples/models/muse-glimmer/runtime/engine/muse_glimmer_engine.h
++++ b/examples/models/muse-glimmer/runtime/engine/muse_glimmer_engine.h
+@@ -94,6 +94,7 @@ class MuseGlimmerMultimodalSession {
+ 
+   virtual void stage_image_for_next_prefill(PreparedMuseGlimmerImage image) = 0;
+   virtual void clear_staged_image() = 0;
++  virtual int mutable_state_session_token() const = 0;
+ };
+ 
+ inline MuseGlimmerMultimodalSession* as_muse_glimmer_multimodal_session(
+@@ -126,16 +127,21 @@ class ET_EXPERIMENTAL MuseGlimmerEngine : public LLMEngine {
+   }
+ 
+   ::executorch::runtime::Result<PreparedMuseGlimmerImage>
+-  prepare_image_from_file(const std::string& image_path) const;
++  prepare_image_from_file(
++      const std::string& image_path,
++      int session_token = kMuseGlimmerNoMutableSession) const;
+ 
+   ::executorch::runtime::Result<PreparedMuseGlimmerImage>
+   prepare_image_from_bytes(
+-      ::executorch::runtime::Span<const uint8_t> encoded_image) const;
++      ::executorch::runtime::Span<const uint8_t> encoded_image,
++      int session_token = kMuseGlimmerNoMutableSession) const;
+ 
+   ::executorch::runtime::Result<PreparedMuseGlimmerImage>
+-  prepare_image_from_bytes(const std::vector<uint8_t>& encoded_image) const {
++  prepare_image_from_bytes(
++      const std::vector<uint8_t>& encoded_image,
++      int session_token = kMuseGlimmerNoMutableSession) const {
+     return prepare_image_from_bytes(::executorch::runtime::Span<const uint8_t>(
+-        encoded_image.data(), encoded_image.size()));
++        encoded_image.data(), encoded_image.size()), session_token);
+   }
+ 
+   MuseGlimmerArtifactMode artifact_mode() const {
+diff --git a/examples/models/muse-glimmer/runtime/engine/muse_glimmer_vision_runtime.cpp b/examples/models/muse-glimmer/runtime/engine/muse_glimmer_vision_runtime.cpp
+index 8c187c138..03bd32011 100644
+--- a/examples/models/muse-glimmer/runtime/engine/muse_glimmer_vision_runtime.cpp
++++ b/examples/models/muse-glimmer/runtime/engine/muse_glimmer_vision_runtime.cpp
+@@ -194,7 +194,8 @@ MuseGlimmerVisionRuntime::MuseGlimmerVisionRuntime(
+ 
+ Result<PreparedMuseGlimmerImage>
+ MuseGlimmerVisionRuntime::prepare_image_from_file(
+-    const std::string& image_path) const {
++    const std::string& image_path,
++    const MuseGlimmerVisionExecute& execute) const {
+   auto signature =
+       read_file_signature_with_limit(image_path, config_.max_encoded_bytes);
+   if (!signature.ok()) {
+@@ -234,12 +235,13 @@ MuseGlimmerVisionRuntime::prepare_image_from_file(
+   if (!validate_image_dimensions(width, height, config_)) {
+     return Error::InvalidExternalData;
+   }
+-  return prepare_decoded_image(rgb.get(), width, height);
++  return prepare_decoded_image(rgb.get(), width, height, execute);
+ }
+ 
+ Result<PreparedMuseGlimmerImage>
+ MuseGlimmerVisionRuntime::prepare_image_from_bytes(
+-    Span<const uint8_t> encoded_image) const {
++    Span<const uint8_t> encoded_image,
++    const MuseGlimmerVisionExecute& execute) const {
+   if (encoded_image.empty()) {
+     ET_LOG(Error, "Muse Glimmer encoded image is empty");
+     return Error::InvalidArgument;
+@@ -285,14 +287,15 @@ MuseGlimmerVisionRuntime::prepare_image_from_bytes(
+   if (!validate_image_dimensions(width, height, config_)) {
+     return Error::InvalidExternalData;
+   }
+-  return prepare_decoded_image(rgb.get(), width, height);
++  return prepare_decoded_image(rgb.get(), width, height, execute);
+ }
+ 
+ Result<PreparedMuseGlimmerImage>
+ MuseGlimmerVisionRuntime::prepare_decoded_image(
+     const uint8_t* rgb,
+     int32_t width,
+-    int32_t height) const {
++    int32_t height,
++    const MuseGlimmerVisionExecute& execute) const {
+   muse_glimmer_vision::VisionInputs inputs;
+   try {
+     inputs = muse_glimmer_vision::preprocess_image(
+@@ -340,7 +343,9 @@ MuseGlimmerVisionRuntime::prepare_decoded_image(
+ 
+   std::lock_guard<std::mutex> guard(*config_.execution_mutex);
+   const auto encoder_start = std::chrono::steady_clock::now();
+-  auto outputs = config_.module->execute("vision_encoder", encoder_inputs);
++  auto outputs = execute
++      ? execute(encoder_inputs)
++      : config_.module->execute("vision_encoder", encoder_inputs);
+   if (!outputs.ok()) {
+     ET_LOG(Error, "Muse Glimmer vision_encoder execution failed");
+     return outputs.error();
+diff --git a/examples/models/muse-glimmer/runtime/engine/muse_glimmer_vision_runtime.h b/examples/models/muse-glimmer/runtime/engine/muse_glimmer_vision_runtime.h
+index a4074b1cd..82716370b 100644
+--- a/examples/models/muse-glimmer/runtime/engine/muse_glimmer_vision_runtime.h
++++ b/examples/models/muse-glimmer/runtime/engine/muse_glimmer_vision_runtime.h
+@@ -8,6 +8,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
+ #include <mutex>
+ #include <string>
+ #include <string_view>
+@@ -19,6 +20,10 @@
+ 
+ namespace executorch::extension::llm {
+ 
++using MuseGlimmerVisionExecute = std::function<
++    ::executorch::runtime::Result<std::vector<::executorch::runtime::EValue>>(
++        const std::vector<::executorch::runtime::EValue>&)>;
++
+ struct PreparedMuseGlimmerImage {
+   std::vector<uint16_t> embeddings;
+   int64_t num_soft_tokens = 0;
+@@ -44,23 +49,29 @@ class MuseGlimmerVisionRuntime final {
+   explicit MuseGlimmerVisionRuntime(MuseGlimmerVisionRuntimeConfig config);
+ 
+   ::executorch::runtime::Result<PreparedMuseGlimmerImage>
+-  prepare_image_from_file(const std::string& image_path) const;
++  prepare_image_from_file(
++      const std::string& image_path,
++      const MuseGlimmerVisionExecute& execute = {}) const;
+ 
+   ::executorch::runtime::Result<PreparedMuseGlimmerImage>
+   prepare_image_from_bytes(
+-      ::executorch::runtime::Span<const uint8_t> encoded_image) const;
++      ::executorch::runtime::Span<const uint8_t> encoded_image,
++      const MuseGlimmerVisionExecute& execute = {}) const;
+ 
+   ::executorch::runtime::Result<PreparedMuseGlimmerImage>
+-  prepare_image_from_bytes(const std::vector<uint8_t>& encoded_image) const {
++  prepare_image_from_bytes(
++      const std::vector<uint8_t>& encoded_image,
++      const MuseGlimmerVisionExecute& execute = {}) const {
+     return prepare_image_from_bytes(::executorch::runtime::Span<const uint8_t>(
+-        encoded_image.data(), encoded_image.size()));
++        encoded_image.data(), encoded_image.size()), execute);
+   }
+ 
+  private:
+   ::executorch::runtime::Result<PreparedMuseGlimmerImage> prepare_decoded_image(
+       const uint8_t* rgb,
+       int32_t width,
+-      int32_t height) const;
++      int32_t height,
++      const MuseGlimmerVisionExecute& execute) const;
+ 
+   MuseGlimmerVisionRuntimeConfig config_;
+   std::vector<float> pos_embed_table_;
+diff --git a/examples/models/muse-glimmer/runtime/runners/muse_glimmer_worker.cpp b/examples/models/muse-glimmer/runtime/runners/muse_glimmer_worker.cpp
+index 188cad335..44815ce90 100644
+--- a/examples/models/muse-glimmer/runtime/runners/muse_glimmer_worker.cpp
++++ b/examples/models/muse-glimmer/runtime/runners/muse_glimmer_worker.cpp
+@@ -11,6 +11,9 @@
+ 
+ #include <gflags/gflags.h>
+ 
++#include <poll.h>
++#include <unistd.h>
++
+ #include <executorch/examples/llm_server/cpp/worker_loop.h>
+ #include <executorch/examples/models/muse-glimmer/runtime/engine/dflash_session.h>
+ #include <executorch/examples/models/muse-glimmer/runtime/engine/muse_glimmer_engine.h>
+@@ -77,6 +80,27 @@ namespace llm = ::executorch::extension::llm;
+ using ::executorch::runtime::Error;
+ using Json = nlohmann::json;
+ 
++bool consume_cancel_request() {
++  pollfd input = {STDIN_FILENO, POLLIN, 0};
++  const int ready = poll(&input, 1, 0);
++  if (ready < 0) {
++    throw std::runtime_error("failed to poll worker control input");
++  }
++  if (ready == 0 || (input.revents & POLLIN) == 0) {
++    return false;
++  }
++
++  std::string line;
++  if (!std::getline(std::cin, line) || line.empty()) {
++    return false;
++  }
++  const Json control = Json::parse(line);
++  if (control.value("op", std::string{}) != "cancel") {
++    throw std::runtime_error("unexpected worker request during generation");
++  }
++  return true;
++}
++
+ llm::MuseGlimmerArtifactMode parse_artifact_mode(const std::string& value) {
+   if (value == "auto") {
+     return llm::MuseGlimmerArtifactMode::Auto;
+@@ -187,6 +211,11 @@ int run_muse_glimmer_worker_loop(llm::MuseGlimmerEngine& engine) {
+     try {
+       Json request = Json::parse(line);
+       const std::string op = request.value("op", std::string{});
++      if (op == "cancel") {
++        // A cancel can race with the terminal generation event. Silently
++        // consume the stale line so it cannot poison the next response.
++        continue;
++      }
+       if (op == "open" || op == "close" || op == "reset") {
+         handle_session_operation(sessions, request);
+         continue;
+@@ -231,7 +260,8 @@ int run_muse_glimmer_worker_loop(llm::MuseGlimmerEngine& engine) {
+         if (decoded.error() != Error::Ok) {
+           throw std::runtime_error("invalid base64 image payload");
+         }
+-        auto prepared = engine.prepare_image_from_bytes(decoded.get());
++        auto prepared = engine.prepare_image_from_bytes(
++            decoded.get(), multimodal->mutable_state_session_token());
+         if (prepared.error() != Error::Ok) {
+           throw std::runtime_error("image decode or vision encoding failed");
+         }
+@@ -251,7 +281,8 @@ int run_muse_glimmer_worker_loop(llm::MuseGlimmerEngine& engine) {
+             engine.metadata(),
+             request,
+             prefix,
+-            additional_terminal_stats);
++            additional_terminal_stats,
++            consume_cancel_request);
+       } catch (...) {
+         if (multimodal != nullptr) {
+           multimodal->clear_staged_image();
